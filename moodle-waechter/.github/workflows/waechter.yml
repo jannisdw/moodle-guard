@@ -1,0 +1,51 @@
+name: Moodle-Wächter
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Zustand laden
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: waechter-state-${{ github.run_id }}
+          restore-keys: waechter-state-
+
+      - name: Wächter ausführen
+        env:
+          MOODLE_CALENDAR_URL: ${{ secrets.MOODLE_CALENDAR_URL }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          STATE_FILE: state.json
+        run: python moodle-waechter/moodle_waechter.py
+
+      - name: Zustand speichern
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: waechter-state-${{ github.run_id }}
+
+      - name: Lebenszeichen (Keepalive)
+        run: |
+          last=$(git log -1 --format=%ct)
+          now=$(date +%s)
+          if [ $((now - last)) -gt $((30*24*3600)) ]; then
+            git config user.name "moodle-waechter"
+            git config user.email "moodle-waechter@users.noreply.github.com"
+            git commit --allow-empty -m "Keepalive"
+            git push
+          fi
