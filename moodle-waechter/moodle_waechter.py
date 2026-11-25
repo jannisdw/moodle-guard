@@ -47,6 +47,9 @@ CALENDAR_URL = os.environ.get("MOODLE_CALENDAR_URL", "")
 NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")
 DONE_TOPIC = f"{NTFY_TOPIC}-done"
+PAUSE_TOPIC = f"{NTFY_TOPIC}-pause"
+# In den letzten 30 Minuten: zusätzlicher Push nach so vielen Minuten (innerhalb eines Laufs)
+LAST_LEVEL_EXTRA_MIN = float(os.environ.get("LAST_LEVEL_EXTRA_MIN", "7.5"))
 STATE_FILE = Path(os.environ.get("STATE_FILE", SCRIPT_DIR / "state.json"))
 NAG_FROM_HOURS = float(os.environ.get("NAG_FROM_HOURS", "2"))
 TZ = ZoneInfo("Europe/Zurich")
@@ -196,23 +199,42 @@ def send_push(title: str, message: str, priority: int, tags: list[str],
         pass
 
 
-def fetch_done_ids() -> set[str]:
-    """Liest, welche Aufgaben per Knopf als abgegeben markiert wurden."""
-    url = f"{NTFY_SERVER}/{DONE_TOPIC}/json?poll=1&since=all"
+def fetch_topic_messages(topic: str) -> list[tuple[int, str]]:
+    """Alle gespeicherten Nachrichten eines ntfy-Topics als (Zeit, Text), älteste zuerst."""
+    url = f"{NTFY_SERVER}/{topic}/json?poll=1&since=all"
     try:
         text = http_get(url)
     except Exception as e:
-        print(f"Konnte Abgegeben-Liste nicht lesen: {e}")
-        return set()
-    ids = set()
+        print(f"Konnte Topic {topic} nicht lesen: {e}")
+        return []
+    result = []
     for line in text.splitlines():
         try:
             msg = json.loads(line)
         except json.JSONDecodeError:
             continue
         if msg.get("event") == "message" and msg.get("message"):
-            ids.add(msg["message"].strip())
-    return ids
+            result.append((int(msg.get("time", 0)), msg["message"].strip()))
+    return sorted(result)
+
+
+def fetch_done_ids() -> set[str]:
+    """Liest, welche Aufgaben per Knopf als abgegeben markiert wurden."""
+    return {m for _, m in fetch_topic_messages(DONE_TOPIC)}
+
+
+def update_pause(state: dict) -> bool:
+    """Pause-Schalter (Maustaste am PC): gilt nur für den heutigen Tag.
+    Ab Mitternacht ist der Wächter automatisch wieder aktiv."""
+    messages = fetch_topic_messages(PAUSE_TOPIC)
+    if messages:
+        ts, text = messages[-1]  # die neueste Nachricht entscheidet
+        if text.lower() == "pause":
+            state["pause_day"] = datetime.fromtimestamp(ts, TZ).strftime("%Y-%m-%d")
+        else:
+            state["pause_day"] = ""
+    today = datetime.now(TZ).strftime("%Y-%m-%d")
+    return state.get("pause_day") == today
 
 
 # --------------------------------------------------------------------------
@@ -227,6 +249,7 @@ def load_state() -> dict:
     state.setdefault("levels", {})
     state.setdefault("done", {})
     state.setdefault("last_error_day", "")
+    state.setdefault("pause_day", "")
     return state
 
 
@@ -265,6 +288,38 @@ def report_error(state: dict, text: str, dry_run: bool) -> None:
             state["last_error_day"] = today
         except Exception as e:
             print(f"Konnte Fehler-Push nicht senden: {e}")
+
+
+def push_round(deadlines: list[dict], state: dict, now: int, dry_run: bool,
+               force: bool = False) -> set[str]:
+    """Schickt fällige Pushes. Gibt die IDs zurück, die in der letzten Stufe sind."""
+    last_level_ids = set()
+    for d in deadlines:
+        seconds_left = d["due"] - now
+        if seconds_left <= 0 or d["id"] in state["done"]:
+            continue
+        lvl = level_for(seconds_left / 3600)
+        if lvl is None:
+            continue
+        if lvl == len(LEVELS) - 1:
+            last_level_ids.add(d["id"])
+
+        last_lvl = state["levels"].get(d["id"], -1)
+        nag = seconds_left <= NAG_FROM_HOURS * 3600
+        if lvl <= last_lvl and not nag and not force:
+            continue
+
+        _, priority, tags, prefix = LEVELS[lvl]
+        due_str = datetime.fromtimestamp(d["due"], TZ).strftime("%a %d.%m. %H:%M")
+        title = f"{prefix}: {d['name']}"
+        message = (f"{d['course']}\n"
+                   f"Fällig: {due_str} (noch {format_left(seconds_left)})\n"
+                   f"Abgegeben? Tippe auf «✅ Abgegeben», dann ist Ruhe.")
+        send_push(title, message, priority, tags,
+                  event_id=d["id"], click=d["url"] or None, dry_run=dry_run)
+        print(f"Push: {title} | {due_str}")
+        state["levels"][d["id"]] = lvl
+    return last_level_ids
 
 
 def main() -> None:
@@ -310,29 +365,22 @@ def main() -> None:
     for done_id in fetch_done_ids():
         state["done"].setdefault(done_id, now)
 
-    for d in deadlines:
-        seconds_left = d["due"] - now
-        if seconds_left <= 0 or d["id"] in state["done"]:
-            continue
-        lvl = level_for(seconds_left / 3600)
-        if lvl is None:
-            continue
+    if update_pause(state):
+        print("Pausiert (Maustaste) – heute keine Pushes. Ab Mitternacht wieder aktiv.")
+    else:
+        last_level_ids = push_round(deadlines, state, now, dry_run)
 
-        last_lvl = state["levels"].get(d["id"], -1)
-        nag = seconds_left <= NAG_FROM_HOURS * 3600
-        if lvl <= last_lvl and not nag:
-            continue
-
-        _, priority, tags, prefix = LEVELS[lvl]
-        due_str = datetime.fromtimestamp(d["due"], TZ).strftime("%a %d.%m. %H:%M")
-        title = f"{prefix}: {d['name']}"
-        message = (f"{d['course']}\n"
-                   f"Fällig: {due_str} (noch {format_left(seconds_left)})\n"
-                   f"Abgegeben? Tippe auf «✅ Abgegeben», dann ist Ruhe.")
-        send_push(title, message, priority, tags,
-                  event_id=d["id"], click=d["url"] or None, dry_run=dry_run)
-        print(f"Push: {title} | {due_str}")
-        state["levels"][d["id"]] = lvl
+        # Letzte 30 Minuten: nach 7.5 Minuten nochmals pushen (GitHub läuft nur alle 15 Min)
+        if last_level_ids and "--no-wait" not in args:
+            wait = int(LAST_LEVEL_EXTRA_MIN * 60)
+            print(f"Letzte 30 Minuten: warte {LAST_LEVEL_EXTRA_MIN:g} Min für den Extra-Push …")
+            time.sleep(0 if dry_run else wait)
+            now2 = int(time.time())
+            for done_id in fetch_done_ids():
+                state["done"].setdefault(done_id, now2)
+            if not update_pause(state):
+                push_round([d for d in deadlines if d["id"] in last_level_ids],
+                           state, now2, dry_run, force=True)
 
     # Aufräumen: Einträge älter als 30 Tage weg
     upcoming = {d["id"] for d in deadlines if d["due"] > now - 86400}
