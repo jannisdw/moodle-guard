@@ -28,7 +28,7 @@ jobs:
       - name: Wächter ausführen
         env:
           MOODLE_CALENDAR_URL: ${{ secrets.MOODLE_CALENDAR_URL }}
-          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NTFY_TOPIC: ${{ vars.NTFY_TOPIC }}
           STATE_FILE: state.json
         run: python moodle-waechter/moodle_waechter.py
 
